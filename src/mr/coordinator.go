@@ -18,7 +18,7 @@ type TaskType int
 type TaskId string
 type TaskStatus int
 type WorkerId int
-type IntermediateFileMap map[string]map[WorkerId]string
+type IntermediateFileMap map[string]map[WorkerId][]string
 type TaskOutput struct {
 	filenames []string
 	duration  time.Duration
@@ -97,6 +97,10 @@ type Coordinator struct {
 	workers           map[WorkerId]*WorkerMetdata
 	finished          bool
 	done              chan struct{}
+	wg                sync.WaitGroup
+	shutdownSignaled  bool
+	allGoroutinesDone bool
+	pendingMappers    int
 }
 
 // An RPC handler to find next available task (map or reduce)
@@ -131,8 +135,20 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	// failed/crashed (timeout of not reporting reached) and we added another instance of the same task.
 	// Even if two workers report completion of same task only one of them will remove the task from running queue and add it to
 	// success set, Reporting by slower worker will be skipped.
-	for c.readyTasks.GetTaskCount() > 0 && task.Status == StatusSuccess {
-		task = c.readyTasks.RemoveTask()
+
+	// Only assing a reduce task when we are sure there is no pending map task left
+	// Since then reduce task will surely fail because of unavailabiltiy of intermeidate fiel data
+	for task != nil {
+		if task.Status == StatusSuccess || (task.Type == ReduceType && c.pendingMappers > 0) {
+			if task.Status == StatusSuccess {
+				fmt.Printf("[GetTask]: Skipping ready task %s since it is already successfully completed\n", task.Id)
+			} else {
+				fmt.Printf("[GetTask]: Skipping reduce task %s since there are %d pending mappers\n", task.Id, c.pendingMappers)
+			}
+			task = c.readyTasks.RemoveTask()
+		} else {
+			break
+		}
 	}
 
 	// Either all tasks are completed (if len(runningTasks) == 0)
@@ -145,7 +161,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		return nil
 	}
 
-	fmt.Printf("[GetTask]: Found a task with id %s for worker %d. Current Task Status: %v\n", task.Id, task.Worker, task.Status)
+	fmt.Printf("[GetTask]: Found a task with id %s for worker %d. Current Task Status: %v\n", task.Id, args.WorkerId, task.Status)
 
 	// Found a task with Status as either `StatusError` or `StatusReady` or `StatusRunning`
 	// If task's status is: `StatusError`` -> Retrying failed task again
@@ -156,26 +172,24 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	task.Status = StatusRunning
 	reply.Task = *task
 
-	if task.Type == ReduceType {
-		// Add intermediate file locations collected from various map executions
-		reply.IntermediateFiles = c.intermediateFiles[task.Filename]
-	}
+	// if task.Type == ReduceType {
+	// 	// Add intermediate file locations collected from various map executions
+	// 	reply.IntermediateFiles = c.intermediateFiles[task.Filename]
+	// }
+
+	reply.NR = c.nReduce
 
 	// Update list of workers currently processing a taskId
-	rt, ok := c.runningTasks[task.Id]
+	rt := c.runningTasks[task.Id]
 
-	if !ok || rt == nil {
-		rt = &RunningTask{
-			task: task,
-		}
-		c.runningTasks[task.Id] = rt
-	} else {
-		c.runningTasks[task.Id].task = task
+	if rt == nil {
+		c.runningTasks[task.Id] = &RunningTask{}
 	}
+	c.runningTasks[task.Id].task = task
 
 	c.runningTasks[task.Id].workers = append(c.runningTasks[task.Id].workers, args.WorkerId)
 
-	if ok {
+	if workerMetadata != nil {
 		workerMetadata.lastHeartBeat = time.Now()
 		workerMetadata.runningTask = task.Id
 	} else {
@@ -193,10 +207,27 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	taskSuccessInstance := c.successTasks[args.Id]
-	taskRunningInstances := c.runningTasks[args.Id].workers
+	reply.Status = true
 
-	workerMetadata := c.workers[args.Worker]
+	taskSuccessInstance := c.successTasks[args.Task.Id]
+	v := c.runningTasks[args.Task.Id]
+
+	if v == nil {
+		c.runningTasks[args.Task.Id] = &RunningTask{
+			workers: make([]WorkerId, 0),
+		}
+	}
+
+	taskRunningInstances := c.runningTasks[args.Task.Id].workers
+
+	workerMetadata, ok := c.workers[args.Task.Worker]
+
+	if !ok {
+		reply.Status = false
+		fmt.Printf("[ReportTask]: Something went wrong! WorkerMetadata for worker %d does not exists! While assigning task to worker it should have been created for the worker.\n", args.Task.Worker)
+		return nil
+	}
+
 	workerMetadata.lastHeartBeat = time.Now()
 	// Reported task is already in success set.
 	// Possibly retried after timeout by another worker
@@ -210,10 +241,10 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	// This case is possible if the worker failed to send heartbeat before timeout
 	// In that case we move all the runningTasks from worker's metdata back to ready queue
 	// We also delete the workerId from global runningTasks map corresponding to given taskId.
-	// This results in worker loosing shared shared ownership for given taskId
+	// This results in worker loosing shared ownership for given taskId
 	// This can be termed as late reporting
 	if !isWorkerOwnerOfTask(args, &taskRunningInstances) {
-		fmt.Println("[ReportTask]: Worker %d was never assigned the task %s.\n", args.Worker, args.Id)
+		fmt.Printf("[ReportTask]: Worker %d lost ownership of the task %s.\n", args.Task.Worker, args.Task.Id)
 		// Remove the runningTask from workerMetdata
 		workerMetadata.runningTask = ""
 		return nil
@@ -224,8 +255,8 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	// with status `StatusReady`, Otherwise wait for other worker's report.
 	// coordinator's runningTasks list will gurantee that it consists of workers for a taskid which haven't timedout
 	// And actually processing the task
-	if args.Status == StatusError {
-		fmt.Printf("[ReportTask]: Task %s reported with status %v by worker %d\n", args.Id, args.Status, args.Worker)
+	if args.Task.Status == StatusError {
+		fmt.Printf("[ReportTask]: Task %s reported with status %v by worker %d\n", args.Task.Id, args.Task.Status, args.Task.Worker)
 
 		// Update global state of coordinator
 		disOwnWorkerFromTask(args, &taskRunningInstances)
@@ -235,13 +266,8 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 
 		// No other worker processing the same task
 		// Adding task back to ready queue with `StatusReady`
-		if len(c.runningTasks[args.Id].workers) == 0 {
+		if len(c.runningTasks[args.Task.Id].workers) == 0 {
 			task := args.Task
-			// Adding the task back to ready queue only if it is of map type
-			// A error in reduce task means possible loog
-			if task.Type == MapType {
-
-			}
 
 			// Resetting details of task before adding it back to ready queue
 			task.Worker = 0
@@ -253,7 +279,7 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 			// It is possible there are other workers still processng the task
 			// In this case we will not do anything with failed task report by current worker
 			// And wait for other running worker's status for this task
-			fmt.Printf("[ReportTask]: Task %s is still processed by %d other workers. Skipping retrial of the task. Waiting for report by other workers.\n", args.Id, len(c.runningTasks[args.Id].workers))
+			fmt.Printf("[ReportTask]: Task %s is still processed by %d other workers. Skipping retrial of the task. Waiting for report by other workers.\n", args.Task.Id, len(c.runningTasks[args.Task.Id].workers))
 		}
 
 		return nil
@@ -262,45 +288,55 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	// Task reported successfully, This will be first success reporting of a task
 	// If another task already reported with success it will be already present in `successTasks`
 	// and will be skipped
-	if args.Status == StatusSuccess {
+	if args.Task.Status == StatusSuccess {
 		// Depending on the type of task getting completed we need to handle this
 		// accordingly and update args.Task
 
-		switch args.Type {
+		switch args.Task.Type {
 		case MapType:
 			{
 				// 1. Extract hash from the intermediate file names
-				// 	  File name structure: mr-<taskId>-<hash>
+				// 	  File name structure: w-<workerId>/mr-m-<taskId>-<hash>
 				// 2. Save the hash->filename pair in `IntermediateFileMap`
 				// 3. Update worker's metadata
 				// 4. Remove completed task from runningTasks and add it to successfulTasks
 
-				intermediateFiles := args.Output
+				intermediateFiles := args.Task.Output
 
-				fmt.Printf("[ReportTask]: Mapper Task %s completed successfully, produced following intermediate files: %v\n", args.Id, intermediateFiles)
+				fmt.Printf("[ReportTask]: Mapper Task %s completed successfully by worker %d, produced following intermediate files: %v\n", args.Task.Id, args.Task.Worker, intermediateFiles)
 
 				for _, filename := range intermediateFiles {
-					partitionKey := strings.Split(filename, "-")[2]
-					c.intermediateFiles[partitionKey][args.Worker] = filename
+					partitionKey := strings.Split(filename, "-")[4]
+					paritionFiles, ok := c.intermediateFiles[partitionKey]
+
+					if !ok || paritionFiles == nil {
+						paritionFiles = make(map[WorkerId][]string)
+					}
+					paritionFiles[args.Task.Worker] = append(paritionFiles[args.Task.Worker], filename)
+					c.intermediateFiles[partitionKey] = paritionFiles
 				}
 
 				workerMetadata.lastHeartBeat = time.Now()
-				workerMetadata.successfulTasks[args.Id] = &TaskOutput{
+				workerMetadata.successfulTasks[args.Task.Id] = &TaskOutput{
 					filenames: intermediateFiles,
-					duration:  time.Now().Sub(args.StartTime),
+					duration:  time.Since(args.Task.StartTime),
 				}
+				workerMetadata.runningTask = ""
 
 				// Deletion of task from running instance map will automatically disown
 				// other workers processing the same task
-				delete(c.runningTasks, args.Id)
-				c.successTasks[args.Id] = &args.Task
+				delete(c.runningTasks, args.Task.Id)
+				c.successTasks[args.Task.Id] = &args.Task
+
+				c.pendingMappers--
 
 				// Check if this was the last Map Task
 				// If Yes then we need to add R reduce tasks to the ready queue
 				// TODO: find a way to not to re-add the reduce task if this is done earlier, case possible
 				// If mapper task is being retired after reduce tasks have been added -> This is possible if
 				// A worker excuting a reduce task crashed, since in that case we re-execute all `successful tasks` of that worker
-				if c.readyTasks.GetTaskCount() == 0 && len(c.runningTasks) == 0 && len(c.successTasks) == c.nMap {
+				// if c.readyTasks.GetTaskCount() == 0 && len(c.runningTasks) == 0 && len(c.successTasks) == c.nMap {
+				if c.pendingMappers == 0 {
 					fmt.Printf("\nAll map task ran successfully. Tasks Run Details: \n %v \n", c.successTasks)
 					fmt.Printf("Map task completed: %d | File input count: %d\n", len(c.successTasks), c.nMap)
 					c.addReduceTasks()
@@ -309,20 +345,21 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 
 		case ReduceType:
 			{
-				reduceOutput := args.Output
+				reduceOutput := args.Task.Output
 
-				fmt.Printf("[ReportTask]: Reduce Task %s completed successfully, produced output files: %v\n", args.Id, reduceOutput)
+				fmt.Printf("[ReportTask]: Reduce Task %s completed successfully by worker %d, produced output files: %v\n", args.Task.Id, args.Task.Worker, reduceOutput)
 
 				workerMetadata.lastHeartBeat = time.Now()
-				workerMetadata.successfulTasks[args.Id] = &TaskOutput{
+				workerMetadata.successfulTasks[args.Task.Id] = &TaskOutput{
 					filenames: reduceOutput,
-					duration:  time.Since(args.StartTime),
+					duration:  time.Since(args.Task.StartTime),
 				}
+				workerMetadata.runningTask = ""
 
 				// Deletion of task from running instance map will automatically disown
 				// other workers processing the same task
-				delete(c.runningTasks, args.Id)
-				c.successTasks[args.Id] = &args.Task
+				delete(c.runningTasks, args.Task.Id)
+				c.successTasks[args.Task.Id] = &args.Task
 
 				if len(c.successTasks) == c.nMap+c.nReduce {
 					fmt.Printf("\nAll reduce tasks ran successfully. Tasks Run Details: \n %v \n", c.successTasks)
@@ -336,10 +373,25 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 
 			}
 		default:
-			fmt.Printf("[ReportTask]: Worker %d reported a task of unknown type with status success, ignoring...\n", args.Worker)
+			fmt.Printf("[ReportTask]: Worker %d reported a task of unknown type with status success, ignoring...\n", args.Task.Worker)
 		}
 
+		fmt.Printf("[ReportTask]: Pending map tasks: %d\n", c.pendingMappers)
+		fmt.Printf("[ReportTask]: Total success task count: %d\n", len(c.successTasks))
+
 	}
+
+	return nil
+}
+
+func (c *Coordinator) GetIntermediateFileLocation(args *GetIntermediateFileLocationArgs, reply *GetIntermediateFileLocationReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	partition := args.Partition
+
+	reply.IntermediateFiles = c.intermediateFiles[partition]
+	reply.NM = c.nMap
 
 	return nil
 }
@@ -363,13 +415,31 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
-	if c.finished {
-		close(c.done)
+	// If the job is marked as finished and we haven't started the shutdown sequence for goroutines yet
+	if c.finished && !c.shutdownSignaled {
+		fmt.Printf("[Coordinator Shutdown]: MR workflow completed. Signaling internal goroutines to stop.\n")
+		close(c.done)             // Signal all listening goroutines
+		c.shutdownSignaled = true // Mark that we've signaled them
 	}
 
-	return c.finished
+	// If we have signaled for shutdown, but haven't yet confirmed all goroutines are done
+	if c.shutdownSignaled && !c.allGoroutinesDone {
+		// Unlock before c.wg.Wait() to allow other goroutines that might need c.mu
+		// (e.g., for their final operations before calling c.wg.Done()) to proceed.
+		// The health check goroutine primarily needs c.mu for c.checkWorkerStatus.
+		// Its exit path via <-c.done does not require c.mu.
+		c.mu.Unlock()
+		c.wg.Wait() // Wait for all goroutines (like the health checker) to call c.wg.Done()
+		c.mu.Lock() // Re-acquire the lock
+		c.allGoroutinesDone = true
+		fmt.Printf("[Coordinator Shutdown]: All internal goroutines have completed.\n")
+	}
+
+	// The coordinator is truly "Done" only if the main job is finished AND all its goroutines have cleaned up.
+	isCompletelyDone := c.finished && c.allGoroutinesDone
+	c.mu.Unlock()
+	return isCompletelyDone
 }
 
 func (c *Coordinator) checkWorkerStatus() {
@@ -384,10 +454,10 @@ func (c *Coordinator) checkWorkerStatus() {
 		// - Remove the worker from global running task list this will disown the worker from the task and
 		//   if later worker reports the task it will be skipped and worker's local metdata will be updated accordingly
 		// - Re-add all successful mapper tasks (and reduce task iff the worker never completed any mapper task) of this worker, remove them from successful set
-		lastHeartBeatDuration := time.Now().Sub(metadata.lastHeartBeat)
+		lastHeartBeatDuration := time.Since(metadata.lastHeartBeat)
 
-		if metadata.runningTask != "" && lastHeartBeatDuration >= WORKER_SLEEP_DURATION {
-			fmt.Printf("Worker %d have not reported in last %s\n", lastHeartBeatDuration)
+		if metadata.runningTask != "" && lastHeartBeatDuration >= WORKER_TIMEOUT_SECONDS {
+			fmt.Printf("Worker %d have not reported in last %s\n", workerId, lastHeartBeatDuration)
 			taskToRetry := make([]*Task, 0)
 
 			// Adding successful map tasks of this worker for retrial
@@ -397,6 +467,7 @@ func (c *Coordinator) checkWorkerStatus() {
 					delete(c.successTasks, taskId)
 				}
 			}
+			fmt.Printf("DEBUG: pendingMappers: %d\n", c.pendingMappers)
 
 			// Tombstoning metdata of intermediate files produced by this worker
 			// From global state so that downstream reduce workers get to know about the failure
@@ -405,21 +476,33 @@ func (c *Coordinator) checkWorkerStatus() {
 			// So that in next retry these reducers have the upsrream map's intermediate files
 			for _, v := range c.intermediateFiles {
 				// new line signifies that the intermediate file produces by this worker is now invalid
-				v[workerId] = "\n"
+				v[workerId] = nil
 			}
 
 			// Adding current running task for retrial based on task type
 			runningTask := c.runningTasks[metadata.runningTask]
 
-			taskToRetry = append(taskToRetry, runningTask.task)
+			if runningTask == nil {
+				fmt.Printf("[checkWorkerStatus]: Local worker state shows worker %d running rask %s whereas global running tasks state does not show any worker for the same task.\n", workerId, metadata.runningTask)
 
-			runningTask.workers = slices.DeleteFunc(c.runningTasks[metadata.runningTask].workers, func(w WorkerId) bool {
+				return
+			}
+
+			taskToRetry = append(taskToRetry, runningTask.task)
+			metadata.runningTask = ""
+
+			runningTask.workers = slices.DeleteFunc(runningTask.workers, func(w WorkerId) bool {
 				return w == workerId
 			})
 
 			if len(taskToRetry) > 0 {
 				for _, task := range taskToRetry {
 					fmt.Printf("[checkWorkerStatus]: Adding task %s of type %d with status %d back to the ready queue.\n", task.Id, task.Type, task.Status)
+
+					if task.Type == MapType && task.Status == StatusSuccess {
+						c.pendingMappers++
+					}
+
 					task.Status = StatusReady
 					task.Worker = 0
 					task.Output = make([]string, 0)
@@ -428,7 +511,13 @@ func (c *Coordinator) checkWorkerStatus() {
 
 				}
 			} else {
-				fmt.Printf("No successful or running task executed by worker %d, nothing to add back to ready queue\n", workerId)
+				fmt.Printf("[checkWorkerStatus]: No successful or running task executed by worker %d, nothing to add back to ready queue\n", workerId)
+			}
+		} else {
+			if metadata.runningTask == "" {
+				fmt.Printf("[checkWorkerStatus]: Worker %d is not executing any task right now, skipping health check\n", workerId)
+			} else {
+				fmt.Printf("[checkWorkerStatus]: Worker %d is currently active with last heartbeat recorded %s later. Executing task %s\n", workerId, lastHeartBeatDuration, metadata.runningTask)
 			}
 		}
 	}
@@ -455,22 +544,26 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		successTasks:      make(map[TaskId]*Task),
 		nReduce:           nReduce,
 		nMap:              len(files),
-		intermediateFiles: make(map[string]map[WorkerId]string),
+		intermediateFiles: make(IntermediateFileMap),
 		done:              make(chan struct{}),
 		finished:          false,
+		workers:           make(map[WorkerId]*WorkerMetdata),
+		shutdownSignaled:  false,
+		allGoroutinesDone: false,
+		pendingMappers:    len(files),
 	}
 
 	fmt.Printf("Initialised ready tasklist of %d tasks\n", len(files))
 
 	c.server()
 
-	// Thread to check worker's health in background.
-	// A channel here is needed to signal the background thread to exit
-	// as soon as the parent thread signals it to do so via repeatitive calls to c.Done()
+	c.wg.Add(1)
 	go func() {
+		defer c.wg.Done()
 		for {
 			select {
 			case <-c.done:
+				fmt.Printf("[Coordinator Shutdown]: Closing worker health check background thread.\n")
 				return
 			default:
 				c.checkWorkerStatus()
@@ -486,7 +579,7 @@ func isWorkerOwnerOfTask(args *ReportTaskArgs, taskRunningInstances *[]WorkerId)
 	// Check the worker list for the task reported just to be double sure that the currently
 	// reporting worker is present in that task's list
 	for _, item := range *taskRunningInstances {
-		if item == args.Worker {
+		if item == args.Task.Worker {
 			return true
 		}
 	}
@@ -494,7 +587,7 @@ func isWorkerOwnerOfTask(args *ReportTaskArgs, taskRunningInstances *[]WorkerId)
 }
 func disOwnWorkerFromTask(args *ReportTaskArgs, taskRunningInstances *[]WorkerId) {
 	*taskRunningInstances = slices.DeleteFunc(*taskRunningInstances, func(w WorkerId) bool {
-		return args.Worker == w
+		return args.Task.Worker == w
 	})
 }
 
@@ -508,10 +601,16 @@ func (c *Coordinator) addReduceTasks() {
 			Id:       TaskId(fmt.Sprintf("r-%d", index)),
 			Filename: partition,
 		}
-		c.readyTasks.AddTask(&task)
 
-		fmt.Printf("Reduce Task with Id %s Added to ready queue (Intermediate partition %s with %d files)\n", task.Id, partition, len(v))
+		if c.successTasks[task.Id] == nil {
+			c.readyTasks.AddTask(&task)
+
+			fmt.Printf("Reduce Task with Id %s Added to ready queue (Intermediate partition %s with %d files)\n", task.Id, partition, len(v))
+		}
+
 		index++
 	}
+
+	c.nReduce = index
 
 }

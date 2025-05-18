@@ -29,15 +29,26 @@ type GetTaskArgs struct {
 }
 
 type GetTaskReply struct {
-	Task
-	IntermediateFiles map[WorkerId]string
+	Task Task
+	NR   int
 }
 
 type ReportTaskArgs struct {
-	Task
+	Task Task
 }
 
 type ReportTaskReply struct {
+	Status bool
+}
+
+type GetIntermediateFileLocationArgs struct {
+	Partition string
+	WorkerId  WorkerId
+}
+
+type GetIntermediateFileLocationReply struct {
+	IntermediateFiles map[WorkerId][]string
+	NM                int
 }
 
 // Add your RPC definitions here.

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"log"
 	"net/rpc"
 	"os"
 	"path/filepath"
@@ -58,7 +57,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 
 	getTaskargs := GetTaskArgs{
-		WorkerId: WorkerId(workerId),
+		WorkerId: workerId,
 	}
 
 	for {
@@ -69,42 +68,78 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		if ok {
 			task := &getTaskReply.Task
+			nReduce := getTaskReply.NR
 
 			switch task.Type {
 			case MapType:
 				{
 					Log(fmt.Sprintf("Assigned map job with task id: %s", task.Id))
-
-					processMapTask(task, mapf)
-
-					reportTaskArgs := ReportTaskArgs{
-						Task: *task,
-					}
-					reportTaskReply := ReportTaskReply{}
-					ok = call("Coordinator.ReportTask", &reportTaskArgs, &reportTaskReply)
-
-					if !ok {
-						Log("Failed to call 'Coordinator.ReportTask' ! Cooridnator not found or exited, closing worker")
-						return
-					}
+					processMapTask(task, nReduce, mapf)
 				}
 			case ReduceType:
 				{
 
 					Log(fmt.Sprintf("Assigned reduce job with task id: %s", task.Id))
-					intermediateFiles := getTaskReply.IntermediateFiles
-					processReduceTask(task, intermediateFiles, reducef)
+
+					getIntermediateFileLocationArgs := GetIntermediateFileLocationArgs{
+						Partition: task.Filename,
+						WorkerId:  workerId,
+					}
+
+					getIntermediateFileLocationReply := GetIntermediateFileLocationReply{}
+
+					ok = call("Coordinator.GetIntermediateFileLocation", &getIntermediateFileLocationArgs, &getIntermediateFileLocationReply)
+
+					if ok {
+						intermediateFiles := getIntermediateFileLocationReply.IntermediateFiles
+						nMap := getIntermediateFileLocationReply.NM
+
+						processReduceTask(task, intermediateFiles, nMap, reducef)
+					} else {
+						Log("Failed to call 'Coordinator.GetIntermediateFileLocation' ! Cooridnator not found or exited, deleting local directory, closing worker.")
+						// removeLocalWorkerDirectory()
+						return
+					}
 				}
 			default:
 				Log("Invalid task recieved")
 			}
 
+			if task.Type != InvalidType {
+				reportTaskArgs := ReportTaskArgs{
+					Task: *task,
+				}
+				reportTaskReply := ReportTaskReply{}
+				ok = call("Coordinator.ReportTask", &reportTaskArgs, &reportTaskReply)
+
+				if !reportTaskReply.Status {
+					Log(fmt.Sprintf("Something wrong happened when reporting task %v to coordinator, check coordinator logs", *task))
+					return
+				}
+
+				if !ok {
+					Log("Failed to call 'Coordinator.ReportTask' ! Cooridnator not found or exited, deleting local directory, closing worker.")
+					removeLocalWorkerDirectory()
+					return
+				}
+			}
+
 			Log("Waiting for sometime before requesting next task or retrying in case invalid task was recieved...")
 			time.Sleep(WORKER_SLEEP_DURATION)
 		} else {
-			Log("Failed to call 'Coordinator.GetTask' ! Cooridnator not found or exited, closing worker")
+			Log("Failed to call 'Coordinator.GetTask' ! Cooridnator not found or exited, deleting local directory, closing worker.")
+			// removeLocalWorkerDirectory()
 			return
 		}
+	}
+
+}
+
+func removeLocalWorkerDirectory() {
+	err := os.RemoveAll(dirName)
+
+	if err != nil {
+		Log(fmt.Sprintf("Error: %s", err))
 	}
 
 }
@@ -144,7 +179,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		Log(fmt.Sprintf("Error: %s", err))
+		return false
 	}
 	defer c.Close()
 
@@ -160,14 +196,14 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 // Processes map task by fetching `Filename` from Task
 // Calls provided mapf function and stores intermediate files after
 // paritioninng them based on `ihash` function
-func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
-	Log(fmt.Sprintf("Processing map task with id %s and file: %s\n", task.Id, task.Filename))
+func processMapTask(task *Task, nReduce int, mapf func(string, string) []KeyValue) error {
+	Log(fmt.Sprintf("Processing map task with id %s and file: %s", task.Id, task.Filename))
 
 	file, err := os.Open(task.Filename)
 
 	if err != nil {
 		task.Status = StatusError
-		Log(fmt.Sprintf("Error: %s\n", err))
+		Log(fmt.Sprintf("Error: %s", err))
 		return err
 	}
 
@@ -177,7 +213,7 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
 	content, err := io.ReadAll(file)
 	if err != nil {
 		task.Status = StatusError
-		Log(fmt.Sprintf("Error: %s\n", err))
+		Log(fmt.Sprintf("Error: %s", err))
 		return err
 	}
 	file.Close()
@@ -186,7 +222,7 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
 	buckets := make(map[int][]KeyValue)
 
 	for _, kv := range intermediate {
-		partition := ihash(kv.Key)
+		partition := ihash(kv.Key) % nReduce
 		buckets[partition] = append(buckets[partition], kv)
 	}
 
@@ -196,7 +232,7 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
 
 		if err != nil {
 			task.Status = StatusError
-			Log(fmt.Sprintf("Error: %s\n", err))
+			Log(fmt.Sprintf("Error: %s", err))
 			return err
 		}
 
@@ -209,7 +245,7 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
 
 			if err != nil {
 				task.Status = StatusError
-				Log(fmt.Sprintf("Error: %s\n", err))
+				Log(fmt.Sprintf("Error: %s", err))
 				return err
 			}
 		}
@@ -221,7 +257,7 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
 
 		if err != nil {
 			task.Status = StatusError
-			Log(fmt.Sprintf("Error: %s\n", err))
+			Log(fmt.Sprintf("Error: %s", err))
 			return err
 		}
 
@@ -233,56 +269,80 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
 
 }
 
-func processReduceTask(task *Task, intermediateFiles map[WorkerId]string, reducef func(string, []string) string) error {
-	Log(fmt.Sprintf("Processing reduce task with id %s\n", task.Id))
+func processReduceTask(task *Task, intermediateFiles map[WorkerId][]string, nMap int, reducef func(string, []string) string) error {
+	Log(fmt.Sprintf("Processing reduce task with id %s", task.Id))
 
 	tempReduceFile, err := os.CreateTemp(dirName, "mwt-*")
 	if err != nil {
 		task.Status = StatusError
-		Log(fmt.Sprintf("Error: %s\n", err))
+		Log(fmt.Sprintf("Error: %s", err))
 		return err
 	}
 	defer tempReduceFile.Close()
 
-	for workerId, filename := range intermediateFiles {
-		Log(fmt.Sprintf("Processing intermediate file %s from worker %d\n", filename, workerId))
+	var kva []KeyValue
+	ifc := 0
 
-		intermediateFile, err := os.Open(filename)
+	for _, filenames := range intermediateFiles {
+		for range filenames {
+			ifc++
+		}
+	}
 
-		if err != nil {
-			task.Status = StatusError
-			Log(fmt.Sprintf("Error: %s\n", err))
-			return err
+	if ifc != nMap {
+		task.Status = StatusError
+		Log(fmt.Sprintf("Error: number of intermediate files: %d do not match number of mappers: %d", ifc, nMap))
+		return fmt.Errorf("error: number of intermediate files: %d do not match number of mappers: %d", ifc, nMap)
+	}
+
+	for workerId, filenames := range intermediateFiles {
+		for _, filename := range filenames {
+			Log(fmt.Sprintf("Processing intermediate file %s from worker %d", filename, workerId))
+
+			intermediateFile, err := os.Open(filename)
+
+			if err != nil {
+				task.Status = StatusError
+				Log(fmt.Sprintf("Error: %s", err))
+				return err
+			}
+
+			dec := json.NewDecoder(intermediateFile)
+
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					if err != io.EOF {
+						Log(fmt.Sprintf("Error decoding KV from intermediate file %s: %v", filename, err))
+						task.Status = StatusError
+						return err
+					}
+					break
+				}
+				kva = append(kva, kv)
+			}
 		}
 
-		dec := json.NewDecoder(intermediateFile)
-		var kva []KeyValue
+	}
 
-		for {
-			var kv KeyValue
-			if err := dec.Decode(&kv); err != nil {
-				break
-			}
-			kva = append(kva, kv)
+	sort.Sort(ByKey(kva))
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
 		}
-
-		i := 0
-		for i < len(kva) {
-			j := i + 1
-			for j < len(kva) && kva[j].Key == kva[i].Key {
-				j++
-			}
-			values := []string{}
-			for k := i; k < j; k++ {
-				values = append(values, kva[k].Value)
-			}
-			output := reducef(kva[i].Key, values)
-
-			// this is the correct format for each line of Reduce output.
-			fmt.Fprintf(tempReduceFile, "%v %v\n", kva[i].Key, output)
-
-			i = j
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
 		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(tempReduceFile, "%v %v\n", kva[i].Key, output)
+
+		i = j
 	}
 
 	reduceFileName := fmt.Sprintf("mr-out-%s", task.Filename)
@@ -292,11 +352,12 @@ func processReduceTask(task *Task, intermediateFiles map[WorkerId]string, reduce
 
 	if err != nil {
 		task.Status = StatusError
-		Log(fmt.Sprintf("Error: %s\n", err))
+		Log(fmt.Sprintf("Error: %s", err))
 		return err
 	}
 
 	task.Output = []string{reduceFileName}
+	task.Status = StatusSuccess
 
 	return nil
 }
