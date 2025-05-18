@@ -29,8 +29,9 @@ type GetTaskArgs struct {
 }
 
 type GetTaskReply struct {
-	Task Task
-	NR   int
+	Task              Task
+	IntermediateFiles map[WorkerId][]string
+	NR                int
 }
 
 type ReportTaskArgs struct {
@@ -41,12 +42,12 @@ type ReportTaskReply struct {
 	Status bool
 }
 
-type GetIntermediateFileLocationArgs struct {
+type CheckWorkerStatusArgs struct {
 	Partition string
 	WorkerId  WorkerId
 }
 
-type GetIntermediateFileLocationReply struct {
+type CheckWorkerStatusReply struct {
 	IntermediateFiles map[WorkerId][]string
 	NM                int
 }

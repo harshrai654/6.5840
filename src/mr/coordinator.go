@@ -172,10 +172,10 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	task.Status = StatusRunning
 	reply.Task = *task
 
-	// if task.Type == ReduceType {
-	// 	// Add intermediate file locations collected from various map executions
-	// 	reply.IntermediateFiles = c.intermediateFiles[task.Filename]
-	// }
+	if task.Type == ReduceType {
+		// Add intermediate file locations collected from various map executions
+		reply.IntermediateFiles = c.intermediateFiles[task.Filename]
+	}
 
 	reply.NR = c.nReduce
 
@@ -384,17 +384,17 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	return nil
 }
 
-func (c *Coordinator) GetIntermediateFileLocation(args *GetIntermediateFileLocationArgs, reply *GetIntermediateFileLocationReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// func (c *Coordinator) CheckWorkersStatus(args *CheckWorkerStatusArgs, reply *CheckWorkerStatusReply) error {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
 
-	partition := args.Partition
+// 	partition := args.Partition
 
-	reply.IntermediateFiles = c.intermediateFiles[partition]
-	reply.NM = c.nMap
+// 	reply.IntermediateFiles = c.intermediateFiles[partition]
+// 	reply.NM = c.nMap
 
-	return nil
-}
+// 	return nil
+// }
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
@@ -461,23 +461,23 @@ func (c *Coordinator) checkWorkerStatus() {
 			taskToRetry := make([]*Task, 0)
 
 			// Adding successful map tasks of this worker for retrial
-			for taskId, _ := range metadata.successfulTasks {
-				if c.successTasks[taskId] != nil && c.successTasks[taskId].Type == MapType {
-					taskToRetry = append(taskToRetry, c.successTasks[taskId])
-					delete(c.successTasks, taskId)
-				}
-			}
-			fmt.Printf("DEBUG: pendingMappers: %d\n", c.pendingMappers)
+			// for taskId, _ := range metadata.successfulTasks {
+			// 	if c.successTasks[taskId] != nil && c.successTasks[taskId].Type == MapType {
+			// 		taskToRetry = append(taskToRetry, c.successTasks[taskId])
+			// 		delete(c.successTasks, taskId)
+			// 	}
+			// }
+			// fmt.Printf("DEBUG: pendingMappers: %d\n", c.pendingMappers)
 
 			// Tombstoning metdata of intermediate files produced by this worker
 			// From global state so that downstream reduce workers get to know about the failure
 			// This will result in reduce workers reporting error and getting re-added to the queue
 			// These redcue workers should always be added after the successful map task of current worker
 			// So that in next retry these reducers have the upsrream map's intermediate files
-			for _, v := range c.intermediateFiles {
-				// new line signifies that the intermediate file produces by this worker is now invalid
-				v[workerId] = nil
-			}
+			// for _, v := range c.intermediateFiles {
+			// 	// new line signifies that the intermediate file produces by this worker is now invalid
+			// 	v[workerId] = nil
+			// }
 
 			// Adding current running task for retrial based on task type
 			runningTask := c.runningTasks[metadata.runningTask]
@@ -499,9 +499,9 @@ func (c *Coordinator) checkWorkerStatus() {
 				for _, task := range taskToRetry {
 					fmt.Printf("[checkWorkerStatus]: Adding task %s of type %d with status %d back to the ready queue.\n", task.Id, task.Type, task.Status)
 
-					if task.Type == MapType && task.Status == StatusSuccess {
-						c.pendingMappers++
-					}
+					// if task.Type == MapType && task.Status == StatusSuccess {
+					// 	c.pendingMappers++
+					// }
 
 					task.Status = StatusReady
 					task.Worker = 0

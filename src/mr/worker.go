@@ -81,25 +81,26 @@ func Worker(mapf func(string, string) []KeyValue,
 
 					Log(fmt.Sprintf("Assigned reduce job with task id: %s", task.Id))
 
-					getIntermediateFileLocationArgs := GetIntermediateFileLocationArgs{
-						Partition: task.Filename,
-						WorkerId:  workerId,
-					}
+					// getIntermediateFileLocationArgs := GetIntermediateFileLocationArgs{
+					// 	Partition: task.Filename,
+					// 	WorkerId:  workerId,
+					// }
 
-					getIntermediateFileLocationReply := GetIntermediateFileLocationReply{}
+					// getIntermediateFileLocationReply := GetIntermediateFileLocationReply{}
+					intermediateFiles := getTaskReply.IntermediateFiles
+					processReduceTask(task, intermediateFiles, reducef)
+					// ok = call("Coordinator.GetIntermediateFileLocation", &getIntermediateFileLocationArgs, &getIntermediateFileLocationReply)
 
-					ok = call("Coordinator.GetIntermediateFileLocation", &getIntermediateFileLocationArgs, &getIntermediateFileLocationReply)
+					// if ok {
+					// 	intermediateFiles := getIntermediateFileLocationReply.IntermediateFiles
+					// 	nMap := getIntermediateFileLocationReply.NM
 
-					if ok {
-						intermediateFiles := getIntermediateFileLocationReply.IntermediateFiles
-						nMap := getIntermediateFileLocationReply.NM
-
-						processReduceTask(task, intermediateFiles, nMap, reducef)
-					} else {
-						Log("Failed to call 'Coordinator.GetIntermediateFileLocation' ! Cooridnator not found or exited, deleting local directory, closing worker.")
-						// removeLocalWorkerDirectory()
-						return
-					}
+					// 	processReduceTask(task, intermediateFiles, nMap, reducef)
+					// } else {
+					// 	Log("Failed to call 'Coordinator.GetIntermediateFileLocation' ! Cooridnator not found or exited, deleting local directory, closing worker.")
+					// 	// removeLocalWorkerDirectory()
+					// 	return
+					// }
 				}
 			default:
 				Log("Invalid task recieved")
@@ -269,7 +270,7 @@ func processMapTask(task *Task, nReduce int, mapf func(string, string) []KeyValu
 
 }
 
-func processReduceTask(task *Task, intermediateFiles map[WorkerId][]string, nMap int, reducef func(string, []string) string) error {
+func processReduceTask(task *Task, intermediateFiles map[WorkerId][]string, reducef func(string, []string) string) error {
 	Log(fmt.Sprintf("Processing reduce task with id %s", task.Id))
 
 	tempReduceFile, err := os.CreateTemp(dirName, "mwt-*")
@@ -281,19 +282,19 @@ func processReduceTask(task *Task, intermediateFiles map[WorkerId][]string, nMap
 	defer tempReduceFile.Close()
 
 	var kva []KeyValue
-	ifc := 0
+	// ifc := 0
 
-	for _, filenames := range intermediateFiles {
-		for range filenames {
-			ifc++
-		}
-	}
+	// for _, filenames := range intermediateFiles {
+	// 	for range filenames {
+	// 		ifc++
+	// 	}
+	// }
 
-	if ifc != nMap {
-		task.Status = StatusError
-		Log(fmt.Sprintf("Error: number of intermediate files: %d do not match number of mappers: %d", ifc, nMap))
-		return fmt.Errorf("error: number of intermediate files: %d do not match number of mappers: %d", ifc, nMap)
-	}
+	// if ifc != nMap {
+	// 	task.Status = StatusError
+	// 	Log(fmt.Sprintf("Error: number of intermediate files: %d do not match number of mappers: %d", ifc, nMap))
+	// 	return fmt.Errorf("error: number of intermediate files: %d do not match number of mappers: %d", ifc, nMap)
+	// }
 
 	for workerId, filenames := range intermediateFiles {
 		for _, filename := range filenames {
