@@ -97,9 +97,41 @@ func (lk *Lock) updateLock(lockValue string, version rpc.Tversion) bool {
 			//Lock acquistion successful with our lock value and version
 			return true
 		}
+	case rpc.ErrMaybe:
+		{
+			// We are not sure if our pur was successful because:
+			// - Maybe our PUT was sucessful but the RPC reply was dropped by server
+			// - It was actually a version mismatch and out lock acquistion failed
+			// To reverify this we need to re-fetch lock's status with GET (We fetched it
+			// First time during Acquire call to get current lock value and version)
+
+			currentLockValue, currentLockVersion, getStatus := lk.ck.Get(lk.id)
+
+			switch getStatus {
+			case rpc.OK:
+				{
+					if currentLockValue == lockValue && currentLockVersion == version+1 {
+						// Current lock's state shows that we are the owner
+						return true
+					}
+
+					// Case of ErrMaybe actuallly being a ErrVersion
+					return false
+				}
+			case rpc.ErrNoKey:
+				{
+					// This case should not be possible but it this case comes up
+					// We need to reexecute Acquire wirh version 0 PUT call
+					return false
+				}
+			default:
+				return false
+			}
+
+		}
 	default:
 		{
-			// With network being unreliable possibility of rpc.ErrMaybe
+			// For all the other cases lets assume we were not able to update the lock
 			return false
 		}
 	}
