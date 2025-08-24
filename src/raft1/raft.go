@@ -30,13 +30,6 @@ const (
 	StateCandidate
 )
 
-const (
-	Success HeartBeatStatus = iota
-	LogMismatch
-	RPCError
-	LeaderSteppedDown
-)
-
 const HEARTBEAT_TIMEOUT = 150 * time.Millisecond
 
 type LogEntry struct {
@@ -172,176 +165,6 @@ type AppendEntriesReply struct {
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	fmt.Printf("[RequestVote: %d]: Candidate %d seeking vote for term: %d.\n", rf.me, args.CandidateId, args.Term)
-
-	// Election voting restrictions for follower
-	// - Candidate's term is older than follower from whom it is seeking vote
-	// - Follower already voted
-	// - Candidate's log is older then the follower
-	// In all the above cases follower will not vote for the candidate and respond back with its current term
-	// for the candidate to roll back to follower
-	isCandidateOfOlderTerm := args.Term < rf.currentTerm
-
-	if isCandidateOfOlderTerm {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-
-		fmt.Printf("[RequestVote: %d]: Candidate %d is of older term. Candidate's term: %d | My current term %d\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-
-		return
-	} else {
-		fmt.Printf("[RequestVote: %d]: Candidate %d is of newer or equal term. Candidate's term: %d | My current term %d\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-
-		if args.Term > rf.currentTerm {
-			if rf.state == StateLeader {
-				if rf.leaderCancelFunc != nil {
-					rf.leaderCancelFunc()
-				}
-			}
-
-			rf.currentTerm = args.Term
-			rf.state = StateFollower
-			rf.votedFor = -1
-		}
-
-		canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
-		var currentLatestLogTerm int
-		currentLatestLogIndex := len(rf.log)
-
-		if currentLatestLogIndex > 0 {
-			currentLatestLogTerm = rf.log[currentLatestLogIndex-1].Term
-		}
-
-		isCandidateLogOlder := args.LastLogTerm < currentLatestLogTerm || (args.LastLogTerm == currentLatestLogTerm && args.LastLogIndex < currentLatestLogIndex)
-
-		if canVote && !isCandidateLogOlder {
-			fmt.Printf("[RequestVote: %d]: Granted vote for term: %d, To candidate %d.\n", rf.me, args.Term, args.CandidateId)
-			rf.votedFor = args.CandidateId
-			rf.lastContactFromLeader = time.Now()
-
-			reply.VoteGranted = true
-		} else {
-			fmt.Printf("[RequestVote: %d]: Candidate %d log is older than me. Log(index/term): Candidate's: (%d, %d) | Mine: (%d, %d).\n", rf.me, args.CandidateId, args.LastLogIndex, args.LastLogTerm, currentLatestLogIndex, currentLatestLogTerm)
-			reply.VoteGranted = false
-		}
-
-		reply.Term = rf.currentTerm
-	}
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Your code here (3A, 3B).
-	// Handling heart beats from leader
-	// When follower recieves heartbeat it should check for heartbeat validity
-
-	// [Case: 1] if args.Term < rf.currentTerm then it means this follower is either a new leader
-	// OR it voted for someone else after least heartbeat.
-	// In such case follower should return reply.Success = false indicating it does not acknowledge the sender
-	// as leader anymore and should set reply.Term = rf.currentTerm. (This indicated sender to step down from leadership)
-
-	// [Case: 2] if args.Term >= rf.currentTerm the the current follower/candidate becomes follower again accepting current leader
-	// In such case rf.currentTerm = args.Term and reply.Success = true with reply.Term = rf.currentTerm (same term as the sender)
-	// In Case 2 we should reset the election timer since we have received the heartbeat from a genuine leader
-
-	// In Case 1 since the previous leader is now left behind, there are 3 possibilities:
-	// 		A. The current peer is a candidate now and an election was already started by it or even finished with it being the current leader
-	// 		B. Some other peer is now a candidate with an election going on OR is a leader now
-	// 		C. No election has taken place till now
-	// In all the above cases we should not interrupt the election timeout or anything else
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if len(args.Entries) == 0 {
-		// Heartbeat
-		fmt.Printf("[AppendEntries: %d]: Recieved heartbeat from leader %d for term %d.\n", rf.me, args.LeaderId, args.Term)
-	}
-
-	if args.Term < rf.currentTerm {
-		fmt.Printf("[AppendEntries: %d]:RPC from leader %d for term %d not acknowledged, Leader's term: %d is older than my current term: %d.\n", rf.me, args.LeaderId, args.Term, args.Term, rf.currentTerm)
-		reply.Success = false
-		reply.Term = rf.currentTerm
-
-		return
-	} else {
-
-		// Sent by current leader
-		// Reset election timeout
-		if rf.state == StateLeader {
-			if rf.leaderCancelFunc != nil {
-				rf.leaderCancelFunc()
-			}
-		}
-
-		rf.lastContactFromLeader = time.Now()
-
-		rf.currentTerm = args.Term
-		rf.state = StateFollower
-
-		latestLogIndex := len(rf.log) - 1
-		logTerm := 0
-
-		if args.PrevLogIndex <= latestLogIndex {
-			logTerm = rf.log[args.PrevLogIndex].Term
-		}
-
-		if logTerm != args.PrevLogTerm {
-			fmt.Printf("[AppendEntries: %d]: RPC from leader %d for term %d not acknowledged. Log terms do not match, (Leader term, Leader index): (%d, %d), peer's term for same log index: %d.\n", rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, logTerm)
-			reply.Success = false
-			reply.Term = rf.currentTerm
-			return
-		}
-
-		reply.Success = true
-		reply.Term = rf.currentTerm
-
-		fmt.Printf("[AppendEntries: %d]: RPC from leader %d for term %d acknowledged.\n", rf.me, args.LeaderId, args.Term)
-
-		// Todo: Handle addition of entires to the log according to following instructions as per paper:
-		// 3. If an existing entry conflicts with a new one (same index
-		// but different terms), delete the existing entry and all that
-		// follow it (§5.3)
-		// 4. Append any new entries not already in the log
-		if len(args.Entries) > 0 {
-			rf.reconcileLogs(args.Entries, args.PrevLogIndex)
-		}
-
-		if args.LeaderCommit > rf.commitIndex {
-			// rf.commitIndex =
-		}
-	}
-
-}
-
-func (rf *Raft) reconcileLogs(leaderEntries []LogEntry, leaderPrevLogIndex int) {
-	nextIndex := leaderPrevLogIndex + 1
-	currentLogLength := len(rf.log)
-	leaderEntriesIndex := 0
-
-	for nextIndex < currentLogLength && leaderEntriesIndex < len(leaderEntries) {
-		if rf.log[nextIndex].Term != leaderEntries[leaderEntriesIndex].Term {
-			break
-		}
-
-		nextIndex++
-		leaderEntriesIndex++
-	}
-
-	if leaderEntriesIndex < len(leaderEntries) {
-		// If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-		rf.log = rf.log[:nextIndex]
-
-		//  Append any new entries not already in the log
-		rf.log = append(rf.log, leaderEntries[leaderEntriesIndex:]...)
-	}
-}
-
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -387,16 +210,25 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.mu.Lock()
-
 	index := -1
 	term := -1
-	isLeader := rf.state == StateLeader
+	isLeader := false
+
+	if rf.killed() {
+		fmt.Printf("[Peer Start: %d]: Killed peer cannot initiate log replication.\n", rf.me)
+		return index, term, isLeader
+	}
+
+	rf.mu.Lock()
+
+	isLeader = rf.state == StateLeader
 
 	if !isLeader {
 		rf.mu.Unlock()
 		return index, term, isLeader
 	}
+
+	term = rf.currentTerm
 
 	// Your code here (3B).
 	// Append the command to current logs.
@@ -412,12 +244,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 	})
 
+	fmt.Printf("[Leader Start: %d]: Sending AppendEntries RPC broadcast to all peer specific threads.\n", rf.me)
 	// 2. Signal all peer go-routines to send AppentEntries RPC
 	// with entries according to their nextIndexes
 	rf.replicatorCond.Broadcast()
 
 	// Apply the log??
 	// Waiting on the applyCh??
+
+	index = len(rf.log) - 1
 
 	rf.mu.Unlock()
 	return index, term, isLeader
@@ -441,6 +276,71 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+// example RequestVote RPC handler.
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	fmt.Printf("[Peer: %d | RequestVote]: Candidate %d seeking vote for term: %d.\n", rf.me, args.CandidateId, args.Term)
+
+	// Election voting restrictions for follower
+	// - Candidate's term is older than follower from whom it is seeking vote
+	// - Follower already voted
+	// - Candidate's log is older then the follower
+	// In all the above cases follower will not vote for the candidate and respond back with its current term
+	// for the candidate to roll back to follower
+	isCandidateOfOlderTerm := args.Term < rf.currentTerm
+
+	if isCandidateOfOlderTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+
+		fmt.Printf("[Peer: %d | RequestVote]: Candidate %d is of older term. Candidate's term: %d | My current term %d\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+
+		return
+	} else {
+		fmt.Printf("[Peer: %d | RequestVote]: Candidate %d is of newer or equal term. Candidate's term: %d | My current term %d\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+
+		if args.Term > rf.currentTerm {
+			if rf.state == StateLeader {
+				fmt.Printf("[Peer: %d | RequestVote]: Recieved vote request from candiate of higher term, winding up my own leadership setup.\n", rf.me)
+				if rf.leaderCancelFunc != nil {
+					rf.leaderCancelFunc()
+					rf.replicatorCond.Broadcast()
+				}
+			}
+
+			rf.currentTerm = args.Term
+			rf.state = StateFollower
+			rf.votedFor = -1
+		}
+
+		canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
+		var currentLatestLogTerm int
+		currentLatestLogIndex := len(rf.log) - 1
+
+		if currentLatestLogIndex > 0 {
+			currentLatestLogTerm = rf.log[currentLatestLogIndex-1].Term
+		}
+
+		isCandidateLogOlder := args.LastLogTerm < currentLatestLogTerm || (args.LastLogTerm == currentLatestLogTerm && args.LastLogIndex < currentLatestLogIndex)
+
+		if canVote && !isCandidateLogOlder {
+			fmt.Printf("[Peer: %d | RequestVote]: Granted vote for term: %d, To candidate %d.\n", rf.me, args.Term, args.CandidateId)
+			rf.votedFor = args.CandidateId
+			rf.lastContactFromLeader = time.Now()
+
+			reply.VoteGranted = true
+		} else {
+			fmt.Printf("[Peer: %d | RequestVote]: Candidate %d log is older than mine. Log(index/term): Candidate's: (%d, %d) | Mine: (%d, %d).\n", rf.me, args.CandidateId, args.LastLogIndex, args.LastLogTerm, currentLatestLogIndex, currentLatestLogTerm)
+			reply.VoteGranted = false
+		}
+
+		reply.Term = rf.currentTerm
+	}
 }
 
 func (rf *Raft) startElection() {
@@ -467,13 +367,13 @@ func (rf *Raft) startElection() {
 		lastLog = rf.log[lastLogIndex-1]
 	}
 
-	fmt.Printf("[Candidate: %d | Election Ticker]: Election timout! Initiating election for term %d.\n", rf.me, rf.currentTerm)
+	fmt.Printf("[Candidate: %d | Election Ticker]: Election timout! Initiating election for term %d, with lastLogIndex: %d & lastLogTerm: %d.\n", rf.me, rf.currentTerm, lastLogIndex, lastLog.Term)
 	fmt.Printf("[Candidate: %d | Election Ticker]: Election timeout reset to: %v.\n", rf.me, rf.electionTimeout)
 
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: lastLogIndex,
+		LastLogIndex: lastLogIndex - 1,
 		LastLogTerm:  lastLog.Term,
 	}
 	requestVoteResponses := make(chan *RequestVoteReply)
@@ -575,92 +475,6 @@ func (rf *Raft) startElection() {
 	}
 }
 
-func (rf *Raft) sendHeartbeat(peerIndex int, ctx context.Context) HeartBeatStatus {
-	rf.mu.Lock()
-
-	if rf.state != StateLeader {
-		if rf.leaderCancelFunc != nil {
-			rf.leaderCancelFunc()
-		}
-
-		rf.mu.Unlock()
-		return LeaderSteppedDown
-	}
-
-	reply := &AppendEntriesReply{}
-	peerNextIndex := rf.nextIndex[peerIndex]
-	prevLogIndex := peerNextIndex - 1
-	prevLogTerm := rf.log[prevLogIndex].Term
-
-	heartbeatTerm := rf.currentTerm
-	peer := rf.peers[peerIndex]
-
-	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-	}
-
-	fmt.Printf("[Leader heartbeat: %d]: Sending heartbeat to peer: %d.\n", rf.me, peerIndex)
-	rf.mu.Unlock()
-
-	ok := peer.Call("Raft.AppendEntries", args, reply)
-
-	rf.mu.Lock()
-
-	if ok {
-		fmt.Printf("[Leader heartbeat: %d]: Sending heartbeat RPC to peer %d successful.\n", rf.me, peerIndex)
-		select {
-		case <-ctx.Done():
-			return LeaderSteppedDown
-		default:
-			{
-				// Check fot change in state during the RPC call
-				if rf.currentTerm != heartbeatTerm || rf.state != StateLeader {
-					// Leader already stepped down
-					return LeaderSteppedDown
-				}
-
-				// Handle Heartbeat response
-				if !reply.Success {
-					if reply.Term > rf.currentTerm {
-						fmt.Printf("[Leader heartbeat: %d]: Stepping down from leadership, Received heartbeat reply from peer %d, with term %d > %d - my term\n", rf.me, peerIndex, reply.Term, rf.currentTerm)
-
-						rf.state = StateFollower
-						rf.currentTerm = reply.Term
-						rf.lastContactFromLeader = time.Now()
-
-						if rf.leaderCancelFunc != nil {
-							rf.leaderCancelFunc()
-						}
-
-						rf.mu.Unlock()
-						return LeaderSteppedDown
-					}
-
-					// Follower rejected the AppendEntries RPC beacuse of log conflict
-					// Update the nextIndex for this follower
-					rf.nextIndex[peerIndex] = rf.nextIndex[peerIndex] - 1
-					rf.mu.Unlock()
-					return LogMismatch
-				} else {
-					fmt.Printf("[Leader heartbeat: %d]: Peer %d, responded success to heartbeat for term %d.\n", rf.me, peerIndex, rf.currentTerm)
-					rf.mu.Unlock()
-
-					return Success
-					// rf.mu.Lock()
-					// rf.nextIndex[peerIndex] = args.PrevLogIndex + 1
-					// rf.mu.Unlock()
-				}
-			}
-		}
-	}
-	fmt.Printf("[Leader heartbeat: %d]: Sending heartbeat RPC to peer %d failed.\n", rf.me, peerIndex)
-	rf.mu.Unlock()
-	return RPCError
-}
-
 func (rf *Raft) setupLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -688,37 +502,24 @@ func (rf *Raft) setupLeader() {
 }
 
 func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
-	// For now only setting up sending heartbeats
-	// for !rf.killed() {
-	// 	select {
-	// 	case <-ctx.Done():
-	// 		fmt.Printf("[Leader: %d]: Leader stepping down from leadership.\n", rf.me)
-	// 		return
-	// 	default:
-	// 		status := rf.sendHeartbeat(peerIndex, ctx)
-
-	// 		switch status {
-	// 		case Success:
-	// 			time.Sleep(HEARTBEAT_TIMEOUT)
-	// 		case LeaderSteppedDown:
-	// 			return
-	// 		case LogMismatch:
-	// 			continue
-	// 		case RPCError:
-	// 			heartbeatMS := 50 + (rand.Int63() % 300) // [50, 350)ms time range
-	// 			time.Sleep(time.Duration(heartbeatMS) * time.Millisecond)
-	// 		}
-	// 	}
-
-	// }
 	logMismatch := false
 	for !rf.killed() {
 		select {
 		case <-ctx.Done():
-			fmt.Printf("[Leader: %d]: Leader stepped down from leadership.\n", rf.me)
+			fmt.Printf("[leader-replicate: %d | peer: %d]: Leader stepped down from leadership before initiating replicate.\n", rf.me, peerIndex)
 			return
 		default:
 			rf.mu.Lock()
+
+			if rf.state != StateLeader {
+				fmt.Printf("[leader-replicate: %d | peer: %d]: Not a leader anymore, winding up my leadership setup.\n", rf.me, peerIndex)
+				if rf.leaderCancelFunc != nil {
+					rf.leaderCancelFunc()
+					rf.replicatorCond.Broadcast()
+				}
+				rf.mu.Unlock()
+				return
+			}
 
 			// Only waiting when:
 			// - There is no log to send - In this case the wait will be signalled by the heartbeat
@@ -727,19 +528,13 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 				rf.replicatorCond.Wait()
 			}
 
-			if rf.state != StateLeader {
-				rf.mu.Unlock()
-				return
-			}
-
 			reply := &AppendEntriesReply{}
-			peerNextIndex := rf.nextIndex[peerIndex]
-			prevLogIndex := peerNextIndex - 1
+			logStartIndex := rf.nextIndex[peerIndex]
+			prevLogIndex := logStartIndex - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
 			replicateTerm := rf.currentTerm
 			peer := rf.peers[peerIndex]
 
-			logStartIndex := rf.nextIndex[peerIndex]
 			logEndIndex := len(rf.log)
 			nLogs := logEndIndex - logStartIndex
 
@@ -748,13 +543,16 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 				LeaderId:     rf.me,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: rf.commitIndex,
 			}
 
 			if nLogs > 0 {
-				args.Entries = make([]LogEntry, nLogs)
-				fmt.Printf("[Leader replicate: %d]: Sending AppendEntries RPC to peer: %d in term %d with log index range [%d, %d).\n", rf.me, peerIndex, replicateTerm, logStartIndex, logEndIndex)
+				entriesToSend := rf.log[logStartIndex:]
+				args.Entries = make([]LogEntry, len(entriesToSend))
+				copy(args.Entries, entriesToSend)
+				fmt.Printf("[leader-replicate: %d | peer: %d]: Sending AppendEntries RPC in term %d with log index range [%d, %d).\n", rf.me, peerIndex, replicateTerm, logStartIndex, logEndIndex)
 			} else {
-				fmt.Printf("[Leader replicate: %d]: Sending AppendEntries Heartbeat RPC to peer: %d for term %d.\n", rf.me, peerIndex, replicateTerm)
+				fmt.Printf("[leader-replicate: %d | peer: %d]: Sending AppendEntries Heartbeat RPC for term %d.\n", rf.me, peerIndex, replicateTerm)
 			}
 
 			rf.mu.Unlock()
@@ -764,17 +562,21 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 			rf.mu.Lock()
 
 			if ok {
-				fmt.Printf("[Leader heartbeat: %d]: Sending heartbeat RPC to peer %d successful.\n", rf.me, peerIndex)
+				// fmt.Printf("[Leader replicate: %d]: Sending AppendEntries RPC to peer %d successful.\n", rf.me, peerIndex)
 				select {
 				case <-ctx.Done():
+					fmt.Printf("[leader-replicate: %d | peer: %d]: Leader stepped down from leadership after sending AppendEntries RPC.\n", rf.me, peerIndex)
+					rf.mu.Unlock()
 					return
 				default:
 					{
 						// Check fot change in state during the RPC call
 						if rf.currentTerm != replicateTerm || rf.state != StateLeader {
 							// Leader already stepped down
+							fmt.Printf("[leader-replicate: %d | peer: %d]: Checked ladership state after getting AppendEntries Reply, Not a leader anymore, Winding up my leadership setup.\n", rf.me, peerIndex)
 							if rf.leaderCancelFunc != nil {
 								rf.leaderCancelFunc()
+								rf.replicatorCond.Broadcast()
 							}
 							rf.mu.Unlock()
 							return
@@ -783,7 +585,7 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 						// Handle Heartbeat response
 						if !reply.Success {
 							if reply.Term > rf.currentTerm {
-								fmt.Printf("[Leader heartbeat: %d]: Stepping down from leadership, Received heartbeat reply from peer %d, with term %d > %d - my term\n", rf.me, peerIndex, reply.Term, rf.currentTerm)
+								fmt.Printf("[leader-replicate: %d: peer: %d]: Stepping down from leadership, Received ApppendEntries reply from peer %d, with term %d > %d - my term\n", rf.me, peerIndex, peerIndex, reply.Term, rf.currentTerm)
 
 								rf.state = StateFollower
 								rf.currentTerm = reply.Term
@@ -791,6 +593,7 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 
 								if rf.leaderCancelFunc != nil {
 									rf.leaderCancelFunc()
+									rf.replicatorCond.Broadcast()
 								}
 
 								rf.mu.Unlock()
@@ -799,24 +602,209 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 
 							// Follower rejected the AppendEntries RPC beacuse of log conflict
 							// Update the nextIndex for this follower
-							rf.nextIndex[peerIndex] = rf.nextIndex[peerIndex] - 1
+							rf.nextIndex[peerIndex] = prevLogIndex
 							logMismatch = true
+
+							fmt.Printf("[leader-replicate: %d | peer: %d]: Logmismatch - AppendEntries RPC with previous log index %d of previous log term %d failed. Retrying with log index:%d.\n", rf.me, peerIndex, prevLogIndex, prevLogTerm, prevLogIndex)
+
 							rf.mu.Unlock()
 							continue
 						} else {
-							fmt.Printf("[Leader heartbeat: %d]: Peer %d, responded success to heartbeat for term %d.\n", rf.me, peerIndex, rf.currentTerm)
+							// fmt.Printf("[Leader replicate: %d]: Peer %d, responded success to AppendEntries RPC for term %d.\n", rf.me, peerIndex, rf.currentTerm)
 							logMismatch = false
 
-							if nLogs 
+							if nLogs > 0 {
+								// Log replication successful
+								rf.nextIndex[peerIndex] = prevLogIndex + nLogs + 1
+								rf.matchIndex[peerIndex] = prevLogIndex + nLogs
+
+								// Need to track majority replication upto latest log index
+								// - So that we can update commitIndex
+								// - Apply logs upto commitIndex
+								// Just an idea - maybe this needs to be done separately in a goroutine
+								// Where we continuosly check lastApplied and commitIndex
+								// Apply and lastApplied to commit index and if leader send the response to apply channel
+								majority := len(rf.peers)/2 + 1
+
+								for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
+									matchedPeerCount := 1
+									if rf.log[i].Term == rf.currentTerm {
+										for pi := range rf.peers {
+											if rf.matchIndex[pi] >= i {
+												matchedPeerCount++
+											}
+										}
+									}
+
+									// Largest possible log index greater the commitIndex replicated at majority of peers
+									// update commitIndex
+									if matchedPeerCount >= majority {
+										rf.commitIndex = i
+
+										fmt.Printf("[leader-replicate: %d | peer: %d]: Log index %d replicated to majority of peers.(%d/%d peers), updating commitIndex.\n", rf.me, peerIndex, i, matchedPeerCount, len(rf.peers))
+
+										// Loop from lastApplied to commitIndex and apply each log
+										for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+											rf.applyCh <- raftapi.ApplyMsg{
+												CommandValid: true,
+												Command:      rf.log[i].Command,
+												CommandIndex: i,
+											}
+										}
+
+										rf.lastApplied = rf.commitIndex
+									}
+								}
+							}
+
+							rf.mu.Unlock()
+							continue
 						}
 					}
 				}
 			}
-			fmt.Printf("[Leader heartbeat: %d]: Sending heartbeat RPC to peer %d failed.\n", rf.me, peerIndex)
+			fmt.Printf("[leader-replicate: %d | peer %d]: Sending AppendEntries RPC at leader's term: %d, failed. Payload prevLogIndex: %d | prevLogTerm: %d.\n", rf.me, peerIndex, replicateTerm, prevLogIndex, prevLogTerm)
 			rf.mu.Unlock()
-			return RPCError
+			continue
 		}
 	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Your code here (3A, 3B).
+	// Handling heart beats from leader
+	// When follower recieves heartbeat it should check for heartbeat validity
+
+	// [Case: 1] if args.Term < rf.currentTerm then it means this follower is either a new leader
+	// OR it voted for someone else after least heartbeat.
+	// In such case follower should return reply.Success = false indicating it does not acknowledge the sender
+	// as leader anymore and should set reply.Term = rf.currentTerm. (This indicated sender to step down from leadership)
+
+	// [Case: 2] if args.Term >= rf.currentTerm the the current follower/candidate becomes follower again accepting current leader
+	// In such case rf.currentTerm = args.Term and reply.Success = true with reply.Term = rf.currentTerm (same term as the sender)
+	// In Case 2 we should reset the election timer since we have received the heartbeat from a genuine leader
+
+	// In Case 1 since the previous leader is now left behind, there are 3 possibilities:
+	// 		A. The current peer is a candidate now and an election was already started by it or even finished with it being the current leader
+	// 		B. Some other peer is now a candidate with an election going on OR is a leader now
+	// 		C. No election has taken place till now
+	// In all the above cases we should not interrupt the election timeout or anything else
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if len(args.Entries) == 0 {
+		// Heartbeat
+		fmt.Printf("[Peer: %d]: Recieved AppendEntries RPC as heartbeat from leader %d for term %d with commitIndex %d.\n", rf.me, args.LeaderId, args.Term, args.LeaderCommit)
+	}
+
+	if args.Term < rf.currentTerm {
+		fmt.Printf("[Peer: %d]: AppendEntries RPC from leader %d for term %d not acknowledged, Leader's term: %d is older than my current term: %d.\n", rf.me, args.LeaderId, args.Term, args.Term, rf.currentTerm)
+		reply.Success = false
+		reply.Term = rf.currentTerm
+
+		return
+	} else {
+
+		// Sent by current leader
+		// Reset election timeout
+		if rf.state == StateLeader {
+			fmt.Printf("[Peer: %d]: AppendEntries RPC recieved from current leader: %d, winding up my leadership setup.\n", rf.me, args.LeaderId)
+			if rf.leaderCancelFunc != nil {
+				rf.leaderCancelFunc()
+				rf.replicatorCond.Broadcast()
+			}
+		}
+
+		rf.lastContactFromLeader = time.Now()
+
+		rf.currentTerm = args.Term
+		rf.state = StateFollower
+
+		latestLogIndex := len(rf.log) - 1
+		logTerm := 0
+
+		if args.PrevLogIndex <= latestLogIndex {
+			logTerm = rf.log[args.PrevLogIndex].Term
+		}
+
+		if logTerm != args.PrevLogTerm {
+			fmt.Printf("[Peer: %d]: AppendEntries RPC from leader %d for term %d not acknowledged. Log terms do not match, (Leader term, Leader index): (%d, %d), peer's term for same log index: %d.\n", rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, logTerm)
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			return
+		}
+
+		reply.Success = true
+		reply.Term = rf.currentTerm
+
+		fmt.Printf("[Peer: %d]: AppendEntries RPC from leader %d for term %d acknowledged.\n", rf.me, args.LeaderId, args.Term)
+
+		// Todo: Handle addition of entires to the log according to following instructions as per paper:
+		// 3. If an existing entry conflicts with a new one (same index
+		// but different terms), delete the existing entry and all that
+		// follow it (§5.3)
+		// 4. Append any new entries not already in the log
+		if len(args.Entries) > 0 {
+			rf.reconcileLogs(args.Entries, args.PrevLogIndex)
+		}
+
+		if args.LeaderCommit > rf.commitIndex {
+			// If leaderCommit > commitIndex, set commitIndex =
+			// min(leaderCommit, index of last new entry)
+
+			rf.commitIndex = args.LeaderCommit
+
+			if args.LeaderCommit >= len(rf.log) {
+				rf.commitIndex = len(rf.log) - 1
+			}
+
+			fmt.Printf("[Peer: %d]: Updated commmit index to %d.\n", rf.me, rf.commitIndex)
+
+			if rf.commitIndex > rf.lastApplied {
+				fmt.Printf("[Peer: %d]: Applied logs till latest commit index, lastApplied updating to %d.\n", rf.me, rf.commitIndex)
+			}
+
+			// Loop from lastApplied to commitIndex and apply each log
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i].Command,
+					CommandIndex: i,
+				}
+
+				rf.lastApplied = rf.commitIndex
+			}
+
+			rf.lastApplied = rf.commitIndex
+		}
+	}
+
+}
+
+func (rf *Raft) reconcileLogs(leaderEntries []LogEntry, leaderPrevLogIndex int) {
+	nextIndex := leaderPrevLogIndex + 1
+	currentLogLength := len(rf.log)
+	leaderEntriesIndex := 0
+
+	for nextIndex < currentLogLength && leaderEntriesIndex < len(leaderEntries) {
+		if rf.log[nextIndex].Term != leaderEntries[leaderEntriesIndex].Term {
+			break
+		}
+
+		nextIndex++
+		leaderEntriesIndex++
+	}
+
+	if leaderEntriesIndex < len(leaderEntries) {
+		// If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+		rf.log = rf.log[:nextIndex]
+
+		//  Append any new entries not already in the log
+		rf.log = append(rf.log, leaderEntries[leaderEntriesIndex:]...)
+	}
+
+	fmt.Printf("[Peer %d]: Reconciled logs with leader from index %d, current logs length %d.\n", rf.me, leaderPrevLogIndex, len(rf.log))
 }
 
 func (rf *Raft) ticker() {
@@ -834,30 +822,6 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Duration(heartbeatMS) * time.Millisecond)
 	}
 }
-
-// func (rf *Raft) heartbeats() {
-// 	for !rf.killed() {
-// 		rf.mu.Lock()
-// 		done := make(chan struct{})
-
-// 		if rf.state == StateLeader && time.Since(rf.lastHeartbeatSent) >= HEARTBEAT_TIMEOUT {
-// 			for peerIndex, peer := range rf.peers {
-// 				if peerIndex != rf.me {
-// 					go rf.sendHeartbeat(peerIndex, peer, done)
-// 				}
-// 			}
-// 			rf.lastHeartbeatSent = time.Now()
-// 			rf.mu.Unlock()
-// 		}
-
-// 		select {
-// 		case <-time.After(HEARTBEAT_TIMEOUT):
-// 			close(done)
-// 		case <-done:
-// 			close(done)
-// 		}
-// 	}
-// }
 
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
