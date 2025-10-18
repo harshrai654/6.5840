@@ -471,7 +471,8 @@ func (rf *Raft) startElection() {
 	lastLogIndex := len(rf.log) - 1
 	var lastLogTerm int
 
-	done := make(chan struct{})
+	// done := make(chan struct{})
+	ctx, cancelElection := context.WithTimeout(context.Background(), rf.electionTimeout)
 
 	if lastLogIndex > 0 {
 		lastLogTerm = rf.log[lastLogIndex].Term
@@ -497,23 +498,14 @@ func (rf *Raft) startElection() {
 	for peerIndex, peer := range rf.peers {
 		if peerIndex != rf.me {
 			go func(peer *labrpc.ClientEnd) {
-				select {
-				case <-done:
-					// Either majority is achieved or candidate is stepping down as candidate
-					// Dont wait for this peer's RequestVote RPC response and exit this goroutine
-					// to prevent goroutine leak
-					return
-				default:
-					reply := &RequestVoteReply{}
-					dprintf("[Candidate: %d | Election Ticker]: Requesting vote from peer: %d.\n", rf.me, peerIndex)
-					ok := peer.Call("Raft.RequestVote", args, reply)
-					if ok {
-						select {
-						case requestVoteResponses <- reply:
-						case <-done:
-							return
-						}
-					}
+				dprintf("[Candidate: %d | Election Ticker]: Requesting vote from peer: %d.\n", rf.me, peerIndex)
+				reply := &RequestVoteReply{}
+				ok := rf.sendRPCWithTimeout(ctx, peer, peerIndex, "RequestVote", args, reply)
+
+				if ok {
+					requestVoteResponses <- reply
+				} else {
+					dprintf("[Candidate: %d | Election Ticker]: RequestVote RPC to peer: %d failed.\n", rf.me, peerIndex)
 				}
 			}(peer)
 		}
@@ -534,7 +526,8 @@ func (rf *Raft) startElection() {
 		case res := <-requestVoteResponses:
 			if rf.killed() {
 				dprintf("[Candidate: %d | Election Ticker]: Candidate killed while waiting for peer RequestVote response. Aborting election process.\n", rf.me)
-				close(done) // Signal all other RequestVote goroutines to stop
+				// Signal all other RequestVote goroutines to stop
+				cancelElection()
 				return
 			}
 
@@ -543,7 +536,7 @@ func (rf *Raft) startElection() {
 			// State stale after RequestVote RPC
 			if rf.currentTerm != electionTerm || rf.state != StateCandidate {
 				rf.mu.Unlock()
-				close(done)
+				cancelElection()
 				return
 			}
 
@@ -559,7 +552,7 @@ func (rf *Raft) startElection() {
 				rf.mu.Unlock()
 
 				rf.persist(nil)
-				close(done)
+				cancelElection()
 				return
 			}
 
@@ -571,7 +564,7 @@ func (rf *Raft) startElection() {
 					rf.state = StateLeader
 
 					rf.mu.Unlock()
-					close(done)
+					cancelElection()
 
 					rf.setupLeader()
 					return
@@ -580,12 +573,10 @@ func (rf *Raft) startElection() {
 
 			rf.mu.Unlock()
 
-		case <-time.After(rf.electionTimeout):
+		case <-ctx.Done():
 			rf.mu.Lock()
 			dprintf("[Candidate: %d | Election Ticker]: Election timeout! Wrapping up election for term: %d. Got %d votes. Current state = %d. Current set term: %d.\n", rf.me, electionTerm, voteCount, rf.state, rf.currentTerm)
 			rf.mu.Unlock()
-
-			close(done)
 			return
 		}
 
@@ -633,6 +624,8 @@ func (rf *Raft) sendRPCWithTimeout(ctx context.Context, peer *labrpc.ClientEnd, 
 			ok = peer.Call("Raft.InstallSnapshot", args, reply)
 		case "AppendEntries":
 			ok = peer.Call("Raft.AppendEntries", args, reply)
+		case "RequestVote":
+			ok = peer.Call("Raft.RequestVote", args, reply)
 		}
 
 		select {
@@ -716,7 +709,6 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 				dprintf("[leader-install-snapshot: %d: peer: %d]: InstallSnapshot RPC with index: %d and term: %d sent.\n", rf.me, peerIndex, args.LastIncludedIndex, args.LastIncludedTerm)
 				rf.mu.Unlock()
 
-				// ok := peer.Call("Raft.InstallSnapshot", args, reply)
 				ok := rf.sendRPCWithTimeout(ctx, peer, peerIndex, "InstallSnapshot", args, reply)
 
 				rf.mu.Lock()
@@ -772,14 +764,11 @@ func (rf *Raft) replicate(peerIndex int, ctx context.Context) {
 				}
 
 				rf.mu.Unlock()
-
-				// ok := peer.Call("Raft.AppendEntries", args, reply)
 				ok := rf.sendRPCWithTimeout(ctx, peer, peerIndex, "AppendEntries", args, reply)
 
 				rf.mu.Lock()
 
 				if ok {
-					// dprintf("[Leader replicate: %d]: Sending AppendEntries RPC to peer %d successful.\n", rf.me, peerIndex)
 					select {
 					case <-ctx.Done():
 						dprintf("[leader-replicate: %d | peer: %d]: Leader stepped down from leadership after sending AppendEntries RPC.\n", rf.me, peerIndex)
@@ -938,7 +927,6 @@ func (rf *Raft) applier() {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Your code here (3A, 3B).
 	// Handling heart beats from leader
 	// When follower recieves heartbeat it should check for heartbeat validity
 
@@ -1028,11 +1016,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		dprintf("[Peer: %d]: AppendEntries RPC from leader %d for term %d acknowledged.\n", rf.me, args.LeaderId, args.Term)
 
-		// Todo: Handle addition of entires to the log according to following instructions as per paper:
-		// 3. If an existing entry conflicts with a new one (same index
-		// but different terms), delete the existing entry and all that
-		// follow it (§5.3)
-		// 4. Append any new entries not already in the log
 		if len(args.Entries) > 0 {
 			rf.reconcileLogs(args.Entries, args.PrevLogIndex)
 		}
